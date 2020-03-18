@@ -1,6 +1,7 @@
 pragma solidity >0.4.13;
 
 contract TaxiMatching {
+	event Match(uint x1, uint y1, uint x2, uint y2, uint distance);
 
 	struct Location {
 		uint x;
@@ -33,13 +34,17 @@ contract TaxiMatching {
 		// first check if there is any offer already
 		uint minDist = 256 ** 2;
 		uint offerIndex = 0;
+		Location memory matchedOffer;
 		for (uint i = 0; i < offers.length; i++) {
 			uint dist = distance(l, offers[i]);
 			if(dist < minDist) {
 				minDist = dist;
 				offerIndex = i;
+				matchedOffer = offers[i];
 			}
 		}
+
+		emit Match(x, y, matchedOffer.x, matchedOffer.y, minDist);
 
 		if(offers.length > 1) {
 			offers[offerIndex] = offers[offers.length-1];
@@ -57,13 +62,17 @@ contract TaxiMatching {
 		// first check if there is any request already
 		uint minDist = 256 ** 2;
 		uint requestIndex = 0;
+		Location memory matchedRequest;
 		for (uint i = 0; i < requests.length; i++) {
 			uint dist = distance(l, requests[i]);
 			if(dist < minDist) {
 				minDist = dist;
 				requestIndex = i;
+				matchedRequest = requests[i];
 			}
 		}
+
+		emit Match(x, y, matchedRequest.x, matchedRequest.y, minDist);
 
 		if(requests.length > 1) {
 			requests[requestIndex] = requests[requests.length-1];
