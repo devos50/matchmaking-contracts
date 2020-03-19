@@ -16,11 +16,61 @@
 
 pragma solidity ^0.5.12;
 
-import "./expiring_market.sol";
 import "./auth.sol";
 import "./note.sol";
+import "./math.sol";
 
-contract MatchingEvents {
+
+contract MatchingMarket is DSAuth, DSMath, DSNote {
+    event LogItemUpdate(uint id);
+    event LogTrade(uint pay_amt, string pay_gem,
+                   uint buy_amt, string buy_gem);
+
+    event LogMake(
+        bytes32  indexed  id,
+        bytes32  indexed  pair,
+        address  indexed  maker,
+        string            pay_gem,
+        string            buy_gem,
+        uint128           pay_amt,
+        uint128           buy_amt,
+        uint64            timestamp
+    );
+
+    event LogBump(
+        bytes32  indexed  id,
+        bytes32  indexed  pair,
+        address  indexed  maker,
+        string            pay_gem,
+        string            buy_gem,
+        uint128           pay_amt,
+        uint128           buy_amt,
+        uint64            timestamp
+    );
+
+    event LogTake(
+        bytes32           id,
+        bytes32  indexed  pair,
+        address  indexed  maker,
+        string            pay_gem,
+        string            buy_gem,
+        address  indexed  taker,
+        uint128           take_amt,
+        uint128           give_amt,
+        uint64            timestamp
+    );
+
+    event LogKill(
+        bytes32  indexed  id,
+        bytes32  indexed  pair,
+        address  indexed  maker,
+        string            pay_gem,
+        string            buy_gem,
+        uint128           pay_amt,
+        uint128           buy_amt,
+        uint64            timestamp
+    );
+
     event LogBuyEnabled(bool isEnabled);
     event LogMinSell(string pay_gem, uint min_amount);
     event LogMatchingEnabled(bool isEnabled);
@@ -28,12 +78,24 @@ contract MatchingEvents {
     event LogSortedOffer(uint id);
     event LogInsert(address keeper, uint id);
     event LogDelete(address keeper, uint id);
-}
 
-contract MatchingMarket is DSAuth, MatchingEvents, ExpiringMarket, DSNote {
+    struct OfferInfo {
+        uint     pay_amt;
+        string   pay_gem;
+        uint     buy_amt;
+        string   buy_gem;
+        address  owner;
+        uint64   timestamp;
+    }
+
+    mapping (uint => OfferInfo) public offers;
+    bool locked;
+    uint64 public close_time;
+    bool public stopped;
     bool public buyEnabled = true;      //buy enabled
     bool public matchingEnabled = true; //true: enable matching,
                                          //false: revert to expiring market
+
     struct sortInfo {
         uint next;  //points to id of next higher offer
         uint prev;  //points to id of previous lower offer
@@ -48,7 +110,54 @@ contract MatchingMarket is DSAuth, MatchingEvents, ExpiringMarket, DSNote {
     uint public dustId;                         // id of the latest offer marked as dust
 
 
-    constructor(uint64 close_time) ExpiringMarket(close_time) public {
+    constructor(uint64 _close_time) public {
+        close_time = _close_time;
+    }
+
+    // after close_time has been reached, no new offers are allowed
+    modifier can_offer {
+        require(!isClosed());
+        _;
+    }
+
+    // after close, no new buys are allowed
+    modifier can_buy(uint id) {
+        require(isActive(id));
+        require(!isClosed());
+        _;
+    }
+
+    modifier synchronized {
+        require(!locked);
+        locked = true;
+        _;
+        locked = false;
+    }
+
+    function isClosed() public view returns (bool closed) {
+        return stopped || getTime() > close_time;
+    }
+
+    function getTime() public view returns (uint64) {
+        return uint64(now);
+    }
+
+    function stop() public {
+        stopped = true;
+    }
+
+    function isActive(uint id) public view returns (bool active) {
+        return offers[id].timestamp > 0;
+    }
+
+    function getOwner(uint id) public view returns (address owner) {
+        return offers[id].owner;
+    }
+
+    function getOffer(uint id) public view returns (uint, string memory, uint, string memory) {
+      OfferInfo memory offer = offers[id];
+      return (offer.pay_amt, offer.pay_gem,
+              offer.buy_amt, offer.buy_gem);
     }
 
     // After close, anyone can cancel an offer
@@ -63,16 +172,33 @@ contract MatchingMarket is DSAuth, MatchingEvents, ExpiringMarket, DSNote {
 
     // ---- Public entrypoints ---- //
 
+    function bump(bytes32 id_)
+        public
+        can_buy(uint256(id_))
+    {
+        uint256 id = uint256(id_);
+        emit LogBump(
+            id_,
+            keccak256(abi.encodePacked(offers[id].pay_gem, offers[id].buy_gem)),
+            offers[id].owner,
+            offers[id].pay_gem,
+            offers[id].buy_gem,
+            uint128(offers[id].pay_amt),
+            uint128(offers[id].buy_amt),
+            offers[id].timestamp
+        );
+    }
+
     function make(
+        uint id,
         string memory    pay_gem,
         string memory    buy_gem,
         uint128  pay_amt,
         uint128  buy_amt
     )
         public
-        returns (bytes32)
     {
-        return bytes32(offer(pay_amt, pay_gem, buy_amt, buy_gem));
+        offer(id, pay_amt, pay_gem, buy_amt, buy_gem);
     }
 
     function take(bytes32 id, uint128 maxTakeAmount) public {
@@ -81,6 +207,45 @@ contract MatchingMarket is DSAuth, MatchingEvents, ExpiringMarket, DSNote {
 
     function kill(bytes32 id) public {
         require(cancel(uint256(id)));
+    }
+
+    // Make a new offer. Takes funds from the caller into market escrow.
+    function super_offer(uint id, uint pay_amt, string memory pay_gem, uint buy_amt, string memory buy_gem)
+        public
+        can_offer
+        synchronized
+    {
+        bytes memory b_pay_gem = bytes(pay_gem);
+        bytes memory b_buy_gem = bytes(buy_gem);
+
+        require(uint128(pay_amt) == pay_amt);
+        require(uint128(buy_amt) == buy_amt);
+        require(pay_amt > 0);
+        require(b_pay_gem.length > 0);
+        require(buy_amt > 0);
+        require(b_buy_gem.length > 0);
+        require(keccak256(b_pay_gem) != keccak256(b_buy_gem));
+
+        OfferInfo memory info;
+        info.pay_amt = pay_amt;
+        info.pay_gem = pay_gem;
+        info.buy_amt = buy_amt;
+        info.buy_gem = buy_gem;
+        info.owner = msg.sender;
+        info.timestamp = uint64(now);
+        offers[id] = info;
+
+        emit LogItemUpdate(id);
+        emit LogMake(
+            bytes32(id),
+            keccak256(abi.encodePacked(pay_gem, buy_gem)),
+            msg.sender,
+            pay_gem,
+            buy_gem,
+            uint128(pay_amt),
+            uint128(buy_amt),
+            uint64(now)
+        );
     }
 
     // Make a new offer. Takes funds from the caller into market escrow.
@@ -98,21 +263,22 @@ contract MatchingMarket is DSAuth, MatchingEvents, ExpiringMarket, DSNote {
     //     * no sorting is done.
     //
     function offer(
+        uint id,
         uint pay_amt,    //maker (ask) sell how much
         string memory pay_gem,   //maker (ask) sell which token
         uint buy_amt,    //taker (ask) buy how much
         string memory buy_gem    //taker (ask) buy which token
     )
         public
-        returns (uint)
     {
         require(!locked, "Reentrancy attempt");
-        function (uint256,string memory,uint256,string memory) returns (uint256) fn = matchingEnabled ? _offeru : super.offer;
-        return fn(pay_amt, pay_gem, buy_amt, buy_gem);
+        function (uint,uint256,string memory,uint256,string memory) fn = matchingEnabled ? _offeru : super_offer;
+        fn(id, pay_amt, pay_gem, buy_amt, buy_gem);
     }
 
     // Make a new offer. Takes funds from the caller into market escrow.
     function offer(
+        uint id,
         uint pay_amt,    //maker (ask) sell how much
         string memory pay_gem,   //maker (ask) sell which token
         uint buy_amt,    //maker (ask) buy how much
@@ -121,12 +287,12 @@ contract MatchingMarket is DSAuth, MatchingEvents, ExpiringMarket, DSNote {
     )
         public
         can_offer
-        returns (uint)
     {
-        return offer(pay_amt, pay_gem, buy_amt, buy_gem, pos, true);
+        offer(id, pay_amt, pay_gem, buy_amt, buy_gem, pos, true);
     }
 
     function offer(
+        uint id,
         uint pay_amt,    //maker (ask) sell how much
         string memory pay_gem,   //maker (ask) sell which token
         uint buy_amt,    //maker (ask) buy how much
@@ -136,15 +302,14 @@ contract MatchingMarket is DSAuth, MatchingEvents, ExpiringMarket, DSNote {
     )
         public
         can_offer
-        returns (uint)
     {
         require(!locked, "Reentrancy attempt");
         require(_dust[pay_gem] <= pay_amt);
 
         if (matchingEnabled) {
-          return _matcho(pay_amt, pay_gem, buy_amt, buy_gem, pos, rounding);
+          _matcho(id, pay_amt, pay_gem, buy_amt, buy_gem, pos, rounding);
         }
-        return super.offer(pay_amt, pay_gem, buy_amt, buy_gem);
+        super_offer(id, pay_amt, pay_gem, buy_amt, buy_gem);
     }
 
     //Transfers funds from caller to offer maker, and from market to caller.
@@ -154,8 +319,54 @@ contract MatchingMarket is DSAuth, MatchingEvents, ExpiringMarket, DSNote {
         returns (bool)
     {
         require(!locked, "Reentrancy attempt");
-        function (uint256,uint256) returns (bool) fn = matchingEnabled ? _buys : super.buy;
+        function (uint256,uint256) returns (bool) fn = matchingEnabled ? _buys : super_buy;
         return fn(id, amount);
+    }
+
+    // Accept given `quantity` of an offer. Transfers funds from caller to
+    // offer maker, and from market to caller.
+    function super_buy(uint id, uint quantity)
+        public
+        can_buy(id)
+        synchronized
+        returns (bool)
+    {
+        OfferInfo memory offer = offers[id];
+        uint spend = mul(quantity, offer.buy_amt) / offer.pay_amt;
+
+        require(uint128(spend) == spend);
+        require(uint128(quantity) == quantity);
+
+        // For backwards semantic compatibility.
+        if (quantity == 0 || spend == 0 ||
+            quantity > offer.pay_amt || spend > offer.buy_amt)
+        {
+            return false;
+        }
+
+        offers[id].pay_amt = sub(offer.pay_amt, quantity);
+        offers[id].buy_amt = sub(offer.buy_amt, spend);
+
+        emit LogItemUpdate(id);
+        emit LogTake(
+            bytes32(id),
+            keccak256(abi.encodePacked(offer.pay_gem, offer.buy_gem)),
+            offer.owner,
+            offer.pay_gem,
+            offer.buy_gem,
+            msg.sender,
+            uint128(quantity),
+            uint128(spend),
+            uint64(now)
+        );
+        emit LogTrade(quantity, offer.pay_gem, spend, offer.buy_gem);
+
+        if (offers[id].pay_amt == 0) {
+          delete offers[id];
+          emit LogDelete(msg.sender, id);
+        }
+
+        return true;
     }
 
     // Cancel an offer. Refunds offer maker.
@@ -172,7 +383,33 @@ contract MatchingMarket is DSAuth, MatchingEvents, ExpiringMarket, DSNote {
                 require(_hide(id));
             }
         }
-        return super.cancel(id);    //delete the offer.
+        return super_cancel(id);    //delete the offer.
+    }
+
+    // Cancel an offer. Refunds offer maker.
+    function super_cancel(uint id)
+        public
+        can_cancel(id)
+        synchronized
+        returns (bool success)
+    {
+        // read-only offer. Modify an offer by directly accessing offers[id]
+        OfferInfo memory offer = offers[id];
+        delete offers[id];
+
+        emit LogItemUpdate(id);
+        emit LogKill(
+            bytes32(id),
+            keccak256(abi.encodePacked(offer.pay_gem, offer.buy_gem)),
+            offer.owner,
+            offer.pay_gem,
+            offer.buy_gem,
+            uint128(offer.pay_amt),
+            uint128(offer.buy_amt),
+            uint64(now)
+        );
+
+        success = true;
     }
 
     //insert offer into the sorted list
@@ -201,7 +438,7 @@ contract MatchingMarket is DSAuth, MatchingEvents, ExpiringMarket, DSNote {
         returns (bool)
     {
         require(!locked, "Reentrancy attempt");
-        require(!isActive(id) && _rank[id].delb != 0 && _rank[id].delb < block.number - 10);
+        //require(!isActive(id) && _rank[id].delb != 0 && _rank[id].delb < block.number - 10);
         delete _rank[id];
         emit LogDelete(msg.sender, id);
         return true;
@@ -403,7 +640,7 @@ contract MatchingMarket is DSAuth, MatchingEvents, ExpiringMarket, DSNote {
                 _hide(id);
             }
         }
-        require(super.buy(id, amount));
+        require(super_buy(id, amount));
         // If offer has become dust during buy, we cancel it
         if (isActive(id) && offers[id].pay_amt < _dust[offers[id].pay_gem]) {
             dustId = id; //enable current msg.sender to call cancel(id)
@@ -491,6 +728,7 @@ contract MatchingMarket is DSAuth, MatchingEvents, ExpiringMarket, DSNote {
 
     //match offers with taker offer, and execute token transactions
     function _matcho(
+        uint id,
         uint t_pay_amt,    //taker sell how much
         string memory t_pay_gem,   //taker sell which token
         uint t_buy_amt,    //taker buy how much
@@ -499,7 +737,6 @@ contract MatchingMarket is DSAuth, MatchingEvents, ExpiringMarket, DSNote {
         bool rounding      //match "close enough" orders?
     )
         internal
-        returns (uint id)
     {
         uint best_maker_id;    //highest maker id
         uint t_buy_amt_old;    //taker buy how much saved
@@ -537,9 +774,13 @@ contract MatchingMarket is DSAuth, MatchingEvents, ExpiringMarket, DSNote {
 
         if (t_buy_amt > 0 && t_pay_amt > 0 && t_pay_amt >= _dust[t_pay_gem]) {
             //new offer should be created
-            id = super.offer(t_pay_amt, t_pay_gem, t_buy_amt, t_buy_gem);
+            super_offer(id, t_pay_amt, t_pay_gem, t_buy_amt, t_buy_gem);
             //insert offer into the sorted list
             _sort(id, pos);
+        }
+        else {
+            // this order has been completed entirely
+            emit LogDelete(msg.sender, id); 
         }
     }
 
@@ -548,16 +789,16 @@ contract MatchingMarket is DSAuth, MatchingEvents, ExpiringMarket, DSNote {
     // ****Available to authorized contracts only!**********
     // Keepers should call insert(id,pos) to put offer in the sorted list.
     function _offeru(
+        uint id,
         uint pay_amt,      //maker (ask) sell how much
         string memory pay_gem,     //maker (ask) sell which token
         uint buy_amt,      //maker (ask) buy how much
         string memory buy_gem      //maker (ask) buy which token
     )
         internal
-        returns (uint id)
     {
         require(_dust[pay_gem] <= pay_amt);
-        id = super.offer(pay_amt, pay_gem, buy_amt, buy_gem);
+        super_offer(id, pay_amt, pay_gem, buy_amt, buy_gem);
         _near[id] = _head;
         _head = id;
         emit LogUnsortedOffer(id);
@@ -632,6 +873,7 @@ contract MatchingMarket is DSAuth, MatchingEvents, ExpiringMarket, DSNote {
 
         _span[pay_gem][buy_gem]--;
         _rank[id].delb = block.number;                    //mark _rank[id] for deletion
+        //del_rank(id);
         return true;
     }
 
