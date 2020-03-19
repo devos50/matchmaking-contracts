@@ -11,17 +11,12 @@ contract TaxiMatching {
 	Location[] requests;
 	Location[] offers;
 
-	function sqrt(uint x) private returns (uint y) {
-    	uint z = (x + 1) / 2;
-    	y = x;
-    	while (z < y) {
-        	y = z;
-        	z = (x / z + z) / 2;
-    	}
-	}
-
 	function distance(Location memory l1, Location memory l2) private returns (uint) {
-		return sqrt((l2.x - l1.x) ** 2 + (l2.y - l1.y) ** 2);
+		int x_diff = int(l1.x - l2.x);
+		int y_diff = int(l1.y - l2.y);
+		if(x_diff < 0) { x_diff *= -1; }
+		if(y_diff < 0) { y_diff *= -1; }
+		return uint(x_diff + y_diff);
 	}
 
 	function requestRide(uint x, uint y) public {
